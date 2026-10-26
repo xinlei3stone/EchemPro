@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+
+# PyInstaller 构建产物 (app 通过 build.sh 重建, 不入库)
+build/
+dist/
+*.app
+*.bak
