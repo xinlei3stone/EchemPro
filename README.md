@@ -37,7 +37,7 @@ EchemPro 读取 CS Studio 导出的实验数据，批量完成等效电路拟合
 需要 Python 3.14（开发与打包验证版本为 3.14.3，其他版本未验证）。
 
 ```bash
-git clone https://github.com/PhDStone/EchemPro.git
+git clone https://github.com/xinlei3stone/EchemPro.git
 cd EchemPro
 
 python3 -m venv .venv
@@ -154,6 +154,7 @@ EchemPro/
 ├── requirements.txt          # 运行时依赖（版本同打包环境）
 ├── build.sh                  # 一键重建 macOS 应用
 ├── EchemPro.spec             # PyInstaller 配置
+├── LICENSE                   # MIT 开源协议
 ├── docs/screenshot.png       # 界面截图
 └── PRD.md                    # 产品需求、架构与验收标准
 ```
@@ -175,6 +176,12 @@ E_RHE = E_measured + 0.0592 × pH + E_ref − i × Rs × (iR ratio)
 - app 是冻结产物，改完源码需要重新运行 `./build.sh` 才会生效。
 - `auto` 模式对少数谱形可能选错模型，必要时用 `single` / `double` 强制指定。
 - ad-hoc 签名意味着拷贝到其他 Mac 后首次需右键打开；如需广泛分发，需要 Apple 开发者签名与公证。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE)，版权归 Yang Xinlei 所有。你可以自由使用、修改和再分发本项目的代码（包括商用），只需在副本中保留版权声明和许可声明。软件按“原样”提供，不附带任何担保。
+
+第三方依赖（NumPy、pandas、SciPy、Matplotlib、PyQt5）各自遵循其原许可证。如果 EchemPro 对你的研究有帮助，欢迎在论文中引用本项目。
 
 ## 相关文档
 
