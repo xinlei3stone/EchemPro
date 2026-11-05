@@ -173,7 +173,7 @@ def make_card(title):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EchemPro — EIS / LSV / Tafel Batch Processor")
+        self.setWindowTitle("EchemPro — EIS (DRT) / LSV / Tafel Batch Processor")
         self.resize(1360, 880)
         self.thread = None
 
@@ -289,9 +289,10 @@ class MainWindow(QMainWindow):
                                       decimals=2, singleStep=0.05)
         form.addRow("iR compensation", self.ir_spin)
 
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["auto", "single", "double"])
-        form.addRow("EIS model", self.model_combo)
+        self.lambda_edit = QLineEdit()
+        self.lambda_edit.setPlaceholderText("Empty = L-curve auto")
+        self.lambda_edit.setText("1e-2")
+        form.addRow("DRT λ", self.lambda_edit)
 
         tafel_row = QHBoxLayout()
         self.tafel_lo = QDoubleSpinBox(minimum=-3, maximum=3, value=0.8,
@@ -460,11 +461,22 @@ class MainWindow(QMainWindow):
         if lo >= hi:
             raise ValueError("Tafel window lower bound must be below upper bound")
 
+        lam_text = self.lambda_edit.text().strip()
+        if lam_text:
+            try:
+                drt_lambda = float(lam_text)
+            except ValueError:
+                raise ValueError(f"DRT λ must be a number or empty: {lam_text!r}")
+            if drt_lambda <= 0:
+                raise ValueError("DRT λ must be > 0 (or empty for L-curve)")
+        else:
+            drt_lambda = None
+
         return dict(root=root, folders=[root / n for n in names],
                     labels=labels, tag=tag, ph=self.ph_spin.value(),
                     eref=self.eref_spin.value(), ir_comp=self.ir_spin.value(),
                     rs_manual=rs_manual, tafel_window=(lo, hi),
-                    eis_model=self.model_combo.currentText())
+                    drt_lambda=drt_lambda)
 
     def on_run(self):
         try:
@@ -539,9 +551,10 @@ class MainWindow(QMainWindow):
             "<b>EchemPro</b> — EIS / LSV / Tafel batch processor<br><br>"
             "Input: CS Studio text exports in per-sample folders "
             "(<code>*-EIS.txt</code>, <code>*-LSV.txt</code>).<br>"
-            "Pipeline: equivalent-circuit EIS fitting (auto single/double "
-            "time constant), LSV RHE conversion with iR compensation, "
-            "and Tafel analysis, with comparison plots across samples.<br><br>"
+            "Pipeline: DRT analysis of EIS (Tikhonov + NNLS; λ from L-curve "
+            "or manual), LSV RHE conversion with iR compensation "
+            "(Rs = DRT R∞), and Tafel analysis, with comparison plots "
+            "across samples.<br><br>"
             "Computation: <code>echem_process.py</code>")
 
 

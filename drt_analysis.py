@@ -11,6 +11,9 @@
   - Tikhonov 正则化 (一阶差分罚) + 非负最小二乘 (NNLS, γ ≥ 0)
   - 正则化参数 λ 通过 L-curve 拐点自动选取, 也可用 --lambda 手动指定
 
+run_drt() 是共用入口, echem_process.py (GUI 批处理) 与
+peis_separate_plots.py (单文件三图) 都调用它, 保证三处结果一致。
+
 用法 (在 EchemPro-src/ 下):
   ../RuHeterojunctionHER/.venv/bin/python drt_analysis.py <eis.txt|peis_csv> \
       [--lambda 1e-3] [--out-dir DIR]
@@ -103,6 +106,66 @@ def find_peaks(tau, gamma):
     return peaks
 
 
+def tau_grid(f):
+    """τ 网格: 覆盖数据频率对应的时间常数范围, 两端各延伸 1 个数量级"""
+    f = np.asarray(f, dtype=float)
+    tau_min = 1.0 / (2 * np.pi * f.max()) * 0.1
+    tau_max = 1.0 / (2 * np.pi * f.min()) * 10.0
+    n_dec = np.log10(tau_max / tau_min)
+    return np.logspace(np.log10(tau_min), np.log10(tau_max), max(int(n_dec * 10), 8))
+
+
+def drt_impedance(freqs, tau, gamma, r_inf, L):
+    """由 DRT 结果重建阻抗: Z = R∞ + iωL + ∫γ(τ)/(1+iωτ)dlnτ"""
+    freqs = np.asarray(freqs, dtype=float)
+    omega = 2 * np.pi * freqs
+    dln_tau = np.diff(np.log(tau)).mean()
+    wt = np.outer(omega, tau)
+    return r_inf + 1j * omega * L + (gamma[None, :] / (1 + 1j * wt)).sum(axis=1) * dln_tau
+
+
+def run_drt(f, z_re, z_im, lam=None, tau=None):
+    """执行 DRT 反演, 返回统一结果字典 (GUI / 批处理 / 单文件脚本共用)。
+
+    f, z_re, z_im: 频率 (Hz)、阻抗实部、真实虚部 (电容性为负)。
+    lam: 正则化参数; None 表示用 L-curve 自动选取。
+    tau: 可选的自定义 τ 网格, 默认按频率范围生成。
+    """
+    f = np.asarray(f, dtype=float)
+    z_re = np.asarray(z_re, dtype=float)
+    z_im = np.asarray(z_im, dtype=float)
+    if tau is None:
+        tau = tau_grid(f)
+
+    A, D = build_matrices(f, tau)
+    b = np.concatenate([z_re, z_im])
+    if lam is None:
+        lam, _, _, _ = lcurve_lambda(A, D, b)
+        lam_desc = "L-curve 自动"
+    else:
+        lam_desc = "手动"
+
+    x = solve_drt(A, D, b, float(lam))
+    r_inf, L, gamma = float(x[0]), float(x[1]), x[2:]
+    z_fit = A @ x
+    n = len(f)
+    dln_tau = float(np.diff(np.log(tau)).mean())
+    return {
+        "tau": tau,
+        "gamma": gamma,
+        "r_inf": r_inf,
+        "L": L,
+        "lam": float(lam),
+        "lam_desc": lam_desc,
+        "rel_err": float(np.linalg.norm(z_fit - b) / np.linalg.norm(b)),
+        "r_pol": float(gamma.sum() * dln_tau),
+        "peaks": find_peaks(tau, gamma),
+        "z_fit_re": z_fit[:n],
+        "z_fit_im": z_fit[n:],
+        "f": f,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="DRT 分析 (Tikhonov + NNLS)")
     ap.add_argument("csv", help="EIS 文件路径 (CS Studio *-EIS.txt 或 galvani 转出 csv)")
@@ -116,34 +179,16 @@ def main():
     stem = csv_path.stem
 
     f, z_re, z_im = load_eis(csv_path)
-    # τ 网格: 覆盖数据频率对应的时间常数范围, 两端各延伸 1 个数量级
-    tau_min = 1 / (2 * np.pi * f.max()) * 0.1
-    tau_max = 1 / (2 * np.pi * f.min()) * 10
-    n_dec = np.log10(tau_max / tau_min)
-    tau = np.logspace(np.log10(tau_min), np.log10(tau_max), int(n_dec * 10))
+    drt = run_drt(f, z_re, z_im, lam=args.lam)
+    tau, gamma = drt["tau"], drt["gamma"]
+    lam = drt["lam"]
+    tau_min, tau_max = tau[0], tau[-1]
 
-    A, D = build_matrices(f, tau)
-    b = np.concatenate([z_re, z_im])
-
-    if args.lam is not None:
-        lam = args.lam
-    else:
-        lam, _, _, _ = lcurve_lambda(A, D, b)
-    x = solve_drt(A, D, b, lam)
-
-    r_inf, L, gamma = x[0], x[1], x[2:]
-    z_fit = A @ x
-    n = len(f)
-    z_fit_re, z_fit_im = z_fit[:n], z_fit[n:]
-    rel_err = np.linalg.norm(z_fit - b) / np.linalg.norm(b)
-
-    # 汇总输出
-    r_pol = gamma.sum() * np.diff(np.log(tau)).mean()
-    peaks = find_peaks(tau, gamma)
-    print(f"λ = {lam:.2e} (L-curve 自动)" if args.lam is None else f"λ = {lam:.2e} (手动)")
-    print(f"R∞ = {r_inf:.4f} Ω·cm²,  L = {L:.3e} H,  R_pol(Σγ) ≈ {r_pol:.4f} Ω·cm²")
-    print(f"拟合相对残差 = {rel_err:.2%}")
-    for i in peaks:
+    print(f"λ = {lam:.2e} ({drt['lam_desc']})")
+    print(f"R∞ = {drt['r_inf']:.4f} Ω·cm²,  L = {drt['L']:.3e} H,  "
+          f"R_pol(Σγ) ≈ {drt['r_pol']:.4f} Ω·cm²")
+    print(f"拟合相对残差 = {drt['rel_err']:.2%}")
+    for i in drt["peaks"]:
         print(f"DRT 峰: τ = {tau[i]:.3e} s  (f* = {1/(2*np.pi*tau[i]):.3g} Hz),  γ = {gamma[i]:.4f} Ω·cm²")
 
     # 导出 γ(τ)
@@ -154,6 +199,7 @@ def main():
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))
     fig.suptitle(f"{stem}  |  λ = {lam:.1e}", fontsize=11)
 
+    z_fit_re, z_fit_im = drt["z_fit_re"], drt["z_fit_im"]
     ax = axes[0]
     ax.scatter(z_re, -z_im, c="k", s=22, label="Original EIS Data", zorder=3)
     ax.plot(z_fit_re, -z_fit_im, c="tab:red", lw=1.5, label="DRT Fit")
@@ -181,13 +227,17 @@ def main():
     ax.legend(h1 + h2, l1 + l2, loc="upper right")
     ax.grid(alpha=0.3)
 
-    ax = axes[3 - 1]
+    ax = axes[2]
     ax.plot(tau, gamma, c="tab:blue", lw=1.5)
     ax.fill_between(tau, 0, gamma, color="tab:blue", alpha=0.25)
-    for i in peaks:
-        ax.annotate(f"τ={tau[i]:.2e} s\n(f*={1/(2*np.pi*tau[i]):.2g} Hz)",
-                    (tau[i], gamma[i]), textcoords="offset points", xytext=(0, 10),
-                    ha="center", fontsize=8)
+    # 三联图面板较窄, 峰位改用左上角紧凑列表, 避免标注互相压字
+    if drt["peaks"]:
+        lines = [f"{k+1}. τ={tau[i]:.2e} s, f*={1/(2*np.pi*tau[i]):.2g} Hz"
+                 for k, i in enumerate(drt["peaks"][:8])]
+        ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
+                va="top", ha="left", fontsize=6.5,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75,
+                          edgecolor="0.6", linewidth=0.5))
     ax.set_xscale("log")
     ax.set_xlabel("τ (s)")
     ax.set_ylabel("γ (Ω·cm²)")

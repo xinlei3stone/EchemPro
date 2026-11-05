@@ -12,12 +12,11 @@ CS Studio 文本导出 (20260921 起的数据均为该格式):
 功能 (对每个样品文件夹):
   1. 自动识别 -EIS / -LSV 的 .txt (或 .mpr 转 .csv;
      已内置 galvani 列 ID 182 = "step time/s" <f8 补丁, 见 echemdata/galvani#112)
-  2. EIS: 等效电路比例加权拟合, 默认 auto 模式优先双时间常数
-     Rs+L+(R1‖CPE1)+(R2‖CPE2), GoF 改善 ≤20% 时回退单 Randles
-     (--eis-model single/double 可强制) -> 单样品 Nyquist/Bode (实测点+拟合线),
-     样品间 Nyquist 对比图 + EIS 拟合汇总 CSV
+  2. EIS: DRT (Tikhonov 正则化 + NNLS) 反演, 得到 R∞ / R_pol / γ(τ) 与峰位
+     (λ 默认 1e-2, 可留空走 L-curve 或手动指定) -> 单样品 Nyquist/Bode
+     (实测点+DRT 拟合线) 与 DRT 图, 样品间 Nyquist 对比图 + DRT 汇总/峰位 CSV
   3. LSV: 取回程段 (扫描顶点后), 电位换算 RHE (Hg/HgO, 默认 pH=14,
-     90% iR 补偿, Rs 取该样品 EIS 拟合值, EIS 阻抗已是 Ω·cm² 与
+     90% iR 补偿, Rs 取该样品 DRT 的高频电阻 R∞, EIS 阻抗已是 Ω·cm² 与
      i(A/cm²) 直接相乘得 iR 压降), 保存 *_RHE.csv, 画 LSV 对比图
   4. Tafel: 在指定 Log|J| 窗口内拟合并画对比图 (默认 0.8-1.6)
 
@@ -32,7 +31,7 @@ LSV 说明: 本组 LSV 常以 CV 方式记录完整循环 (去程到顶点后返
       --labels "Ru/NiP annealing" --tag NiP-annealing
   ../RuHeterojunctionHER/.venv/bin/python echem_process.py \
       ../RuHeterojunctionHER/DATA/EC/<date> S1 S4 \
-      --rs 1.414 1.460          # 手动指定 Rs, 跳过 EIS 拟合取值
+      --rs 1.414 1.460          # 手动指定 Rs, 跳过 DRT 的 R∞ 取值
 """
 
 import argparse
@@ -45,7 +44,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import least_squares
+
+from drt_analysis import run_drt
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -97,7 +97,7 @@ def read_cs_eis_txt(path: Path) -> pd.DataFrame:
     """读 CS Studio EIS txt, 归一化为 BioLogic 风格列名:
     freq/Hz, Re(Z)/Ohm, -Im(Z)/Ohm (CS Z'' 电容性为负, 与 BioLogic
     -Im(Z) 同为正值表示电容, 故直接取负)。感抗点 (Z''>0) 保留,
-    双时间常数模型含电感项 L 可吸收。列名按表头文本匹配, 不依赖列序"""
+    DRT 模型含电感项 L 可吸收。列名按表头文本匹配, 不依赖列序"""
     rows = []
     with open(path, "r", encoding="utf-8-sig") as f:
         col_map = None
@@ -189,118 +189,20 @@ def find_one(folder: Path, technique: str):
     return None
 
 
-# ---------------- EIS 等效电路拟合: Rs + (Rct‖CPE) ----------------
+# ---------------- EIS: DRT (Distribution of Relaxation Times) ----------------
 
-def circuit_z(freqs, rs, rct, q, n):
-    """Rs + (Rct‖CPE) 阻抗; CPE: Z = 1/(Q·(jω)^n)"""
-    w = 2 * np.pi * np.asarray(freqs, dtype=float)
-    return rs + rct / (1.0 + rct * q * (1j * w) ** n)
-
-
-def fit_eis(df: pd.DataFrame):
-    """比例加权 (1/|Z|) 最小二乘拟合。返回 dict(rs, rct, q, n, gof, f_fit)"""
-    freqs = df["freq/Hz"].to_numpy(dtype=float)
-    z_meas = (df["Re(Z)/Ohm"].to_numpy(dtype=float)
-              - 1j * df["-Im(Z)/Ohm"].to_numpy(dtype=float))
-
-    rs0 = z_meas.real[0]
-    rct0 = max(z_meas.real.max() - z_meas.real.min(), 1e-3)
-    f_top = freqs[np.argmax(-z_meas.imag)]
-    q0 = 1.0 / (2 * np.pi * f_top * rct0)
-
-    def residuals(p):
-        res = circuit_z(freqs, *p) - z_meas
-        return np.concatenate([res.real, res.imag]) / np.abs(z_meas).repeat(2)
-
-    sol = least_squares(residuals, [rs0, rct0, q0, 0.9],
-                        bounds=([0, 1e-9, 1e-10, 0.5], [np.inf, np.inf, 1e3, 1.0]))
-    rel = np.abs(circuit_z(freqs, *sol.x) - z_meas) / np.abs(z_meas)
-    gof = 100 * np.sqrt(np.mean(rel ** 2))
-    return {"rs": sol.x[0], "rct": sol.x[1], "q": sol.x[2], "n": sol.x[3],
-            "gof": gof,
-            "f_fit": np.logspace(np.log10(freqs.min()), np.log10(freqs.max()), 200)}
+def drt_plot_text(drt):
+    return (f"R∞ = {drt['r_inf']:.2f} Ω·cm²\n"
+            f"R_pol = {drt['r_pol']:.2f} Ω·cm²\n"
+            f"λ = {drt['lam']:.1e},  rel. err = {drt['rel_err']:.1%}")
 
 
-def circuit_z2(freqs, rs, L, r1, q1, n1, r2, q2, n2):
-    """Rs + L + (R1‖CPE1) + (R2‖CPE2) 阻抗; CPE: Z = 1/(Q·(jω)^n)"""
-    w = 2 * np.pi * np.asarray(freqs, dtype=float)
-    return (rs + 1j * w * L
-            + r1 / (1.0 + r1 * q1 * (1j * w) ** n1)
-            + r2 / (1.0 + r2 * q2 * (1j * w) ** n2))
-
-
-def fit_eis2(df: pd.DataFrame):
-    """双时间常数 Rs+L+(R1‖CPE1)+(R2‖CPE2) 比例加权最小二乘拟合"""
-    freqs = df["freq/Hz"].to_numpy(dtype=float)
-    z_meas = (df["Re(Z)/Ohm"].to_numpy(dtype=float)
-              - 1j * df["-Im(Z)/Ohm"].to_numpy(dtype=float))
-    span = max(z_meas.real.max() - z_meas.real.min(), 1e-3)
-
-    def residuals(p):
-        res = circuit_z2(freqs, *p) - z_meas
-        return np.concatenate([res.real, res.imag]) / np.abs(z_meas).repeat(2)
-
-    sol = least_squares(residuals,
-                        [z_meas.real[0], 1e-7, 0.3 * span, 0.05, 0.9,
-                         0.7 * span, 0.3, 0.8],
-                        bounds=([0, 0, 1e-9, 1e-10, 0.5, 1e-9, 1e-10, 0.5],
-                                [np.inf, 1e-3, np.inf, 1e3, 1.0, np.inf, 1e3, 1.0]),
-                        max_nfev=20000)
-    rel = np.abs(circuit_z2(freqs, *sol.x) - z_meas) / np.abs(z_meas)
-    keys = ["rs", "L", "r1", "q1", "n1", "r2", "q2", "n2"]
-    return dict(zip(keys, sol.x), gof=100 * np.sqrt(np.mean(rel ** 2)),
-                f_fit=np.logspace(np.log10(freqs.min()), np.log10(freqs.max()), 200))
-
-
-def fit_eis_auto(df: pd.DataFrame, model: str = "auto"):
-    """EIS 拟合入口。model: auto (默认, 优先双弧) / single / double。
-    auto: 双弧 GoF 相对改善 >20% 时采用双弧, 否则回退单 Randles。
-    返回的 fit dict 带 "model" 键 (1 = 单弧, 2 = 双弧)。"""
-    if model == "single":
-        return dict(fit_eis(df), model=1)
-    if model == "double":
-        return dict(fit_eis2(df), model=2)
-    f1, f2 = fit_eis(df), fit_eis2(df)
-    if f2["gof"] < f1["gof"] * 0.8:
-        return dict(f2, model=2)
-    return dict(f1, model=1)
-
-
-def fit_z(fit, freqs):
-    """按所选模型计算拟合阻抗"""
-    if fit["model"] == 2:
-        return circuit_z2(freqs, fit["rs"], fit["L"], fit["r1"], fit["q1"],
-                          fit["n1"], fit["r2"], fit["q2"], fit["n2"])
-    return circuit_z(freqs, fit["rs"], fit["rct"], fit["q"], fit["n"])
-
-
-def fit_rpol(fit):
-    """总极化电阻: 双弧 = R1+R2, 单弧 = Rct"""
-    return fit["r1"] + fit["r2"] if fit["model"] == 2 else fit["rct"]
-
-
-def fit_label(fit):
-    return ("fit: Rs+L+(R1‖CPE1)+(R2‖CPE2)" if fit["model"] == 2
-            else "fit: Rs+(Rct‖CPE)")
-
-
-def fit_text(fit):
-    if fit["model"] == 2:
-        return (f"Rs = {fit['rs']:.2f} Ω·cm²,  L = {fit['L']:.1e} H\n"
-                f"R1 = {fit['r1']:.2f} Ω·cm² (n1 = {fit['n1']:.2f})\n"
-                f"R2 = {fit['r2']:.2f} Ω·cm² (n2 = {fit['n2']:.2f})\n"
-                f"GoF = {fit['gof']:.1f}%")
-    return (f"Rs = {fit['rs']:.2f} Ω·cm²\nRct = {fit['rct']:.2f} Ω·cm²\n"
-            f"n = {fit['n']:.2f},  GoF = {fit['gof']:.1f}%")
-
-
-def plot_nyquist(df, fit, out, label=None):
+def plot_nyquist(df, drt, out, label=None):
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.plot(df["Re(Z)/Ohm"], df["-Im(Z)/Ohm"], "o", color="0.45",
             markersize=5, label="measured")
-    z_fit = fit_z(fit, fit["f_fit"])
-    ax.plot(z_fit.real, -z_fit.imag, "b-", linewidth=2, label=fit_label(fit))
-    txt = fit_text(fit)
+    ax.plot(drt["z_fit_re"], -drt["z_fit_im"], "b-", linewidth=2,
+            label="DRT fit")
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Re(Z) / Ω·cm²")
     ax.set_ylabel("-Im(Z) / Ω·cm²")
@@ -308,29 +210,56 @@ def plot_nyquist(df, fit, out, label=None):
         ax.set_title(f"Nyquist - {label}")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=11)
-    ax.text(0.03, 0.03, txt, transform=ax.transAxes, va="bottom", fontsize=12,
+    ax.text(0.03, 0.03, drt_plot_text(drt), transform=ax.transAxes,
+            va="bottom", fontsize=12,
             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
     fig.tight_layout()
     fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_bode(df, fit, out):
+def plot_bode(df, drt, out):
     z_meas = (df["Re(Z)/Ohm"].to_numpy(dtype=float)
               - 1j * df["-Im(Z)/Ohm"].to_numpy(dtype=float))
+    z_fit = drt["z_fit_re"] + 1j * drt["z_fit_im"]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
     ax1.semilogx(df["freq/Hz"], np.abs(z_meas), "o", color="0.45", markersize=5)
     phase = np.degrees(np.arctan2(z_meas.imag, z_meas.real))
     ax2.semilogx(df["freq/Hz"], phase, "o", color="0.45", markersize=5)
-    z_fit = fit_z(fit, fit["f_fit"])
-    ax1.semilogx(fit["f_fit"], np.abs(z_fit), "b-", linewidth=2)
-    ax2.semilogx(fit["f_fit"], np.degrees(np.angle(z_fit)), "b-", linewidth=2)
+    ax1.semilogx(drt["f"], np.abs(z_fit), "b-", linewidth=2)
+    ax2.semilogx(drt["f"], np.degrees(np.angle(z_fit)), "b-", linewidth=2)
     ax1.set_xlabel("Frequency / Hz")
     ax1.set_ylabel("|Z| / Ω·cm²")
     ax1.grid(True, which="both", alpha=0.3)
     ax2.set_xlabel("Frequency / Hz")
     ax2.set_ylabel("Phase / deg")
     ax2.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_drt(drt, out, label=None):
+    tau, gamma = drt["tau"], drt["gamma"]
+    fig, ax = plt.subplots(figsize=(7, 4.8))
+    ax.plot(tau, gamma, color="tab:blue", linewidth=1.8)
+    ax.fill_between(tau, 0, gamma, color="tab:blue", alpha=0.25)
+    for k, i in enumerate(drt["peaks"]):
+        left = (k % 2 == 0)
+        ax.annotate(f"τ={tau[i]:.2e} s\n(f*={1/(2*np.pi*tau[i]):.2g} Hz)",
+                    (tau[i], gamma[i]), textcoords="offset points",
+                    xytext=(-14 if left else 14, 14 + 12 * (k % 3)),
+                    ha="right" if left else "left", va="bottom", fontsize=8,
+                    arrowprops=dict(arrowstyle="-", color="0.5", lw=0.6,
+                                    shrinkA=0, shrinkB=3))
+    ax.set_xscale("log")
+    ax.set_xlabel("τ / s")
+    ax.set_ylabel("γ / Ω·cm²")
+    ax.set_title(f"DRT - {label}  (λ = {drt['lam']:.1e})"
+                 if label else f"DRT  (λ = {drt['lam']:.1e})")
+    ax.set_xlim(tau[0], tau[-1])
+    ax.set_ylim(0, max(gamma.max() * 1.45, 1e-12))
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
@@ -383,13 +312,17 @@ def cathodic_sweep(df: pd.DataFrame) -> pd.DataFrame:
 
 def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
             ir_comp=0.9, rs_manual=None, tafel_window=(0.8, 1.6),
-            eis_model="auto", log=print):
-    """对一组样品文件夹执行 EIS 拟合 + LSV RHE/iR 补偿 + Tafel 对比。
+            drt_lambda=None, eis_model=None, log=print):
+    """对一组样品文件夹执行 EIS DRT 分析 + LSV RHE/iR 补偿 + Tafel 对比。
 
     folders: 样品文件夹路径列表 (相对 root 或绝对路径均可)。
     labels / tag 为 None 时按文件夹名自动取值; rs_manual 为各样品手动
-    Rs 列表 (None 则用 EIS 拟合值)。log 为日志回调 (GUI 里接 Qt 信号)。
+    Rs 列表 (None 则用 DRT 的 R∞)。drt_lambda 为 None 时由 L-curve 自动
+    选取正则化参数。log 为日志回调 (GUI 里接 Qt 信号)。
+    eis_model 仅为旧调用兼容保留: EIS 已无等效电路拟合, 传值会被忽略。
     返回 {"tag": ..., "outputs": [...]} 供 GUI 预览生成的文件。"""
+    if eis_model is not None:
+        log("  NOTE: eis_model 已废弃 (EIS 改用 DRT 分析), 忽略该参数")
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"not a directory: {root}")
@@ -414,7 +347,7 @@ def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
     lo, hi = tafel_window
     outputs = []
 
-    # ---- 1. 读取 + EIS 拟合 ----
+    # ---- 1. 读取 + EIS DRT 分析 ----
     log(f"Folder: {root}   samples: {', '.join(labels)}   tag: {tag}")
     samples = []
     for folder, label in zip(folders, labels):
@@ -425,20 +358,30 @@ def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
             try:
                 csv = mpr_to_csv(peis) if peis.suffix == ".mpr" else peis
                 df = load_eis(csv)
-                s["eis_fit"] = fit_eis_auto(df, eis_model)
+                f = df["freq/Hz"].to_numpy(dtype=float)
+                z_re = df["Re(Z)/Ohm"].to_numpy(dtype=float)
+                z_im = -df["-Im(Z)/Ohm"].to_numpy(dtype=float)
+                drt = run_drt(f, z_re, z_im, lam=drt_lambda)
+                s["drt"] = drt
                 s["eis_df"] = df
                 stem = csv.with_suffix("")
                 nyquist_out = Path(f"{stem}_Nyquist.png")
                 bode_out = Path(f"{stem}_Bode.png")
-                plot_nyquist(df, s["eis_fit"], nyquist_out, label=label)
-                plot_bode(df, s["eis_fit"], bode_out)
-                outputs.extend([nyquist_out, bode_out])
-                f = s["eis_fit"]
-                log(f"  {label}: EIS {csv.name} [{fit_label(f)[5:]}] -> "
-                    f"Rs={f['rs']:.3f} Ω·cm², R_pol={fit_rpol(f):.3f} Ω·cm², "
-                    f"GoF={f['gof']:.1f}%")
+                drt_out = Path(f"{stem}_DRT.png")
+                plot_nyquist(df, drt, nyquist_out, label=label)
+                plot_bode(df, drt, bode_out)
+                plot_drt(drt, drt_out, label=label)
+                outputs.extend([nyquist_out, bode_out, drt_out])
+                log(f"  {label}: DRT {csv.name} "
+                    f"[λ={drt['lam']:.1e}, {drt['lam_desc']}] -> "
+                    f"R∞={drt['r_inf']:.3f} Ω·cm², R_pol={drt['r_pol']:.3f} Ω·cm², "
+                    f"peaks={len(drt['peaks'])}, rel.err={drt['rel_err']:.1%}")
+                if drt["rel_err"] > 0.10:
+                    log(f"  WARNING: {label} DRT 相对残差偏大 "
+                        f"({drt['rel_err']:.1%} > 10%), 检查原始谱/低频离群点, "
+                        "可调整 DRT λ")
             except Exception:
-                log(f"  WARNING: EIS fit failed for {label}")
+                log(f"  WARNING: EIS DRT analysis failed for {label}")
                 traceback.print_exc(limit=1)
         else:
             log(f"  {label}: no EIS found")
@@ -450,32 +393,40 @@ def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
             log(f"  {label}: no LSV found")
         samples.append(s)
 
-    # ---- 2. EIS 汇总 + Nyquist 对比 ----
-    fits = [s for s in samples if "eis_fit" in s]
+    # ---- 2. EIS DRT 汇总 + Nyquist 对比 ----
+    fits = [s for s in samples if "drt" in s]
     if fits:
         summary = pd.DataFrame(
-            [(s["label"], fit_label(f)[5:], f["rs"],
-              f["r1"] if f["model"] == 2 else f["rct"],
-              f["r2"] if f["model"] == 2 else np.nan,
-              fit_rpol(f), f["gof"])
-             for s in fits for f in [s["eis_fit"]]],
-            columns=["sample", "model", "Rs/Ohm.cm2", "R1/Ohm.cm2", "R2/Ohm.cm2",
-                     "R_pol/Ohm.cm2", "GoF/%"])
+            [(s["label"], f["lam"], f["r_inf"], f["r_pol"],
+              f["rel_err"] * 100, len(f["peaks"]))
+             for s in fits for f in [s["drt"]]],
+            columns=["sample", "lambda", "R_inf/Ohm.cm2", "R_pol/Ohm.cm2",
+                     "rel_err/%", "n_peaks"])
         out_csv = root / f"EIS_summary_{tag}.csv"
         summary.to_csv(out_csv, index=False, float_format="%.4g")
         outputs.append(out_csv)
         log(f"Saved: {out_csv}")
 
+        peak_rows = [(s["label"], f["tau"][i], 1 / (2 * np.pi * f["tau"][i]),
+                      f["gamma"][i])
+                     for s in fits for f in [s["drt"]] for i in f["peaks"]]
+        if peak_rows:
+            peaks_csv = root / f"EIS_DRT_peaks_{tag}.csv"
+            pd.DataFrame(peak_rows, columns=["sample", "tau/s", "f*/Hz",
+                                             "gamma/Ohm.cm2"]).to_csv(
+                peaks_csv, index=False, float_format="%.4g")
+            outputs.append(peaks_csv)
+            log(f"Saved: {peaks_csv}")
+
         fig, ax = origin_axes()
         for i, s in enumerate(fits):
             c = COLORS[i % len(COLORS)]
-            f = s["eis_fit"]
+            drt = s["drt"]
             ax.plot(s["eis_df"]["Re(Z)/Ohm"], s["eis_df"]["-Im(Z)/Ohm"],
                     "o", markerfacecolor="none", markeredgecolor=c,
                     markeredgewidth=1.5, markersize=6)
-            z_fit = fit_z(f, f["f_fit"])
-            ax.plot(z_fit.real, -z_fit.imag, "-", color=c, lw=2.5,
-                    label=f"{s['label']} ($R_{{pol}}$={fit_rpol(f):.2f})")
+            ax.plot(drt["z_fit_re"], -drt["z_fit_im"], "-", color=c, lw=2.5,
+                    label=f"{s['label']} ($R_{{pol}}$={drt['r_pol']:.2f})")
         xs = np.concatenate([s["eis_df"]["Re(Z)/Ohm"].to_numpy() for s in fits])
         xrange_ = xs.max() * 1.05  # x 从 0 起, 顶端留 5%
         box_ratio = (0.7179 * 208.41) / (0.6818 * 250.02)  # 图层框高宽比
@@ -499,8 +450,8 @@ def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
             continue
         if rs_manual is not None:
             rs = rs_manual[i]
-        elif "eis_fit" in s:
-            rs = s["eis_fit"]["rs"]
+        elif "drt" in s:
+            rs = s["drt"]["r_inf"]
         else:
             rs = 0.0
             log(f"  WARNING: {s['label']} 无 Rs, 未做 iR 补偿")
@@ -510,7 +461,8 @@ def process(root, folders, labels=None, tag=None, ph=14.0, eref=0.098,
         Ewe = seg["E(V)"].to_numpy()
         i_A = seg["i(A/cm²)"].to_numpy()      # 已是电流密度 (面积 1 cm²)
         j_mA = i_A * 1000.0
-        # iR 压降 = i(A/cm²) × Rs(Ω·cm²); EIS 阻抗已是面积归一化值, 直接相乘
+        # iR 压降 = i(A/cm²) × Rs(Ω·cm²); Rs 取 DRT 的 R∞ (高频截距),
+        # EIS 阻抗已是面积归一化值, 直接相乘
         E_RHE = Ewe + 0.0592 * ph + eref - i_A * ir_comp * rs
         out = pd.DataFrame({
             "T/s": seg["T(s)"], "E/V": Ewe, "i/(A cm-2)": i_A,
@@ -605,13 +557,14 @@ def main():
                     help="参比电极电位 vs. SHE / V (默认 0.098, Hg/HgO)")
     ap.add_argument("--ir-comp", type=float, default=0.9, help="iR 补偿比例 (默认 0.9)")
     ap.add_argument("--rs", nargs="+", type=float, default=None,
-                    help="手动指定各样品 Rs / Ω·cm², 跳过 EIS 拟合取值")
+                    help="手动指定各样品 Rs / Ω·cm², 跳过 DRT 的 R∞ 取值")
     ap.add_argument("--tafel-window", nargs=2, type=float, default=[0.8, 1.6],
                     metavar=("LOGJ_MIN", "LOGJ_MAX"), help="Tafel 拟合窗口 (默认 0.8 1.6)")
-    ap.add_argument("--eis-model", choices=["auto", "single", "double"],
-                    default="auto",
-                    help="EIS 等效电路: auto (默认, 优先双时间常数, "
-                         "GoF 改善 ≤20%% 时回退单 Randles) / single / double")
+    ap.add_argument("--drt-lambda", type=float, default=1e-2,
+                    help="DRT 正则化参数 λ (默认 1e-2; 用 --drt-lcurve 改为自动)")
+    ap.add_argument("--drt-lcurve", action="store_true",
+                    help="用 L-curve 自动选取 DRT λ (覆盖 --drt-lambda)")
+    ap.add_argument("--eis-model", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     folders = []
@@ -623,6 +576,7 @@ def main():
         process(root=args.root, folders=folders, labels=args.labels,
                 tag=args.tag, ph=args.ph, eref=args.eref, ir_comp=args.ir_comp,
                 rs_manual=args.rs, tafel_window=args.tafel_window,
+                drt_lambda=None if args.drt_lcurve else args.drt_lambda,
                 eis_model=args.eis_model)
     except ValueError as e:
         sys.exit(f"ERROR: {e}")
